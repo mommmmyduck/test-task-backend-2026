@@ -1,6 +1,5 @@
 import json
 import logging
-from collections import defaultdict
 from typing import Optional, Dict
 
 from sqlalchemy import text
@@ -33,11 +32,19 @@ def update_jsonb_field(entity_id: int,
 
 
 def dict_compare_merge(l_dict1, l_dict2):
-    d = defaultdict(dict)
-    for i in l_dict1 + l_dict2:
-        d[i['general']['id']].update(i)
-
-    return list(d.values())
+    merged = []
+    positions = {}
+    for item in l_dict1 + l_dict2:
+        entity_id = item.get('general', {}).get('id')
+        if entity_id is None:
+            merged.append(item)
+            continue
+        if entity_id in positions:
+            merged[positions[entity_id]].update(item)
+        else:
+            positions[entity_id] = len(merged)
+            merged.append(item.copy())
+    return merged
 
 
 def get_customer_json(customer: Customer) -> dict:

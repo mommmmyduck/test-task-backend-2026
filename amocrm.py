@@ -1,5 +1,5 @@
 import time
-from typing import Type, Any, Iterator
+from typing import Any, Dict, Iterator, Type
 
 import requests
 
@@ -69,6 +69,17 @@ class BaseEntity:
     custom_fields_values = None
     PATCH_FIELDS = None
 
+    def as_dict(self):
+        if self._api_value is not None:
+            return dict(self._api_value)
+        result = {
+            field: getattr(self, field)
+            for field in self.API_FIELDS
+        }
+        if self._embedded is not None:
+            result['_embedded'] = self._embedded
+        return result
+
     def __str__(self):
         return f"<{type(self).__name__}: {self.name}, {self.id}>"
 
@@ -103,26 +114,33 @@ class Customer(BaseEntity):
     """
     url = "api/v4/customers"
     entity_name = CUSTOMERS
+    API_FIELDS = (
+        "id", "name", "next_price", "next_date", "responsible_user_id",
+        "status_id", "periodicity", "created_by", "updated_by", "created_at",
+        "updated_at", "closest_task_at", "is_deleted", "ltv",
+        "purchases_count", "average_check", "account_id",
+        "custom_fields_values",
+    )
 
     def __init__(self,
-                 id,
-                 name,
-                 next_price,
-                 next_date,
-                 responsible_user_id,
-                 status_id,
-                 periodicity,
-                 created_by,
-                 updated_by,
-                 created_at,
-                 updated_at,
-                 closest_task_at,
-                 is_deleted,
-                 ltv,
-                 purchases_count,
-                 average_check,
-                 account_id,
-                 custom_fields_values,
+                 id=None,
+                 name=None,
+                 next_price=None,
+                 next_date=None,
+                 responsible_user_id=None,
+                 status_id=None,
+                 periodicity=None,
+                 created_by=None,
+                 updated_by=None,
+                 created_at=None,
+                 updated_at=None,
+                 closest_task_at=None,
+                 is_deleted=None,
+                 ltv=None,
+                 purchases_count=None,
+                 average_check=None,
+                 account_id=None,
+                 custom_fields_values=None,
                  _embedded=None
                  ):
         self.id = id
@@ -142,8 +160,9 @@ class Customer(BaseEntity):
         self.purchases_count = purchases_count
         self.average_check = average_check
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values or {}
         self._embedded = _embedded
+        self._api_value = None
 
         self.companies = []
         self.contacts = []
@@ -163,6 +182,12 @@ class Lead(BaseEntity):
     url = "api/v4/leads"
     entity_name = LEADS
     PATCH_FIELDS = ("custom_fields_values", "id")
+    API_FIELDS = (
+        "name", "id", "price", "responsible_user_id", "group_id", "status_id",
+        "pipeline_id", "source_id", "created_by", "updated_by", "created_at",
+        "updated_at", "closest_task_at", "is_deleted", "score", "account_id",
+        "custom_fields_values",
+    )
 
     def __init__(self,
                  name=None,
@@ -200,13 +225,71 @@ class Lead(BaseEntity):
         self.is_deleted = is_deleted
         self.score = score
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = custom_fields_values or {}
         self._embedded = _embedded
+        self._api_value = None
         self.tags = []
-        self.contacts = []
-        self.companies = []
+        self.contacts = (_embedded or {}).get(CONTACTS, [])
+        self.companies = (_embedded or {}).get(COMPANIES, [])
+        self.tags = (_embedded or {}).get(TAGS, [])
         if not _embedded:
             return
+
+
+def _normalize_custom_fields_values(custom_fields_values):
+    if custom_fields_values is None:
+        return {}
+    if isinstance(custom_fields_values, dict):
+        return custom_fields_values
+    if not isinstance(custom_fields_values, list):
+        raise ValueError("custom_fields_values must be a list or a field-name mapping")
+
+    normalized = {}
+    for custom_field in custom_fields_values:
+        if not isinstance(custom_field, dict):
+            raise ValueError("Each custom field must be an object")
+        field_name = custom_field.get("field_name")
+        if not field_name:
+            raise ValueError("CRM custom field is missing field_name")
+        values = custom_field.get("values", [])
+        if not isinstance(values, list):
+            raise ValueError("CRM custom field values must be a list")
+        if field_name in normalized:
+            raise ValueError(f"Duplicate CRM custom field name: {field_name}")
+        if values and not isinstance(values[0], dict):
+            raise ValueError(f"Invalid value for CRM custom field: {field_name}")
+
+        normalized[field_name] = {
+            "id": custom_field.get("field_id"),
+            "value": values[0].get("value") if values else None,
+        }
+    return normalized
+
+
+def _entity_from_api_payload(
+        obj_cls: Type[BaseEntity],
+        payload: Dict[str, Any],
+) -> BaseEntity:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{obj_cls.__name__} API entity must be an object")
+    if payload.get("id") is None:
+        raise ValueError(f"{obj_cls.__name__} API entity is missing id")
+
+    embedded = payload.get("_embedded")
+    if embedded is not None and not isinstance(embedded, dict):
+        raise ValueError(f"{obj_cls.__name__} _embedded must be an object")
+
+    entity_data = {
+        field: payload.get(field)
+        for field in obj_cls.API_FIELDS
+    }
+    entity_data["custom_fields_values"] = _normalize_custom_fields_values(
+        payload.get("custom_fields_values")
+    )
+    entity_data["_embedded"] = embedded
+    entity = obj_cls(**entity_data)
+    entity._api_value = dict(payload)
+    return entity
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -239,32 +322,40 @@ def amocrm_get(obj_cls: Type[BaseEntity],
     base_url = ""
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
-    schema = obj_cls.get_schema(many=True)
-
     while True:
-        response = None
         json_data = None
-        try:
-            for try_attempt in range(4):  # 0..3 — до 4 попыток на один запрос
-                try:
-                    response = requests.get(url, params=params, headers=headers, timeout=120)
-                    json_data = response_handler(response)
-                    break
-                except AmoCrmRepeatError as e:
-                    if try_attempt >= 3:
-                        raise e
-                    # повторить тот же запрос (тот же url, params), без нового get() с начала
-                except AmoCrmNoConten:
+        for try_attempt in range(4):
+            response = None
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=120)
+                json_data = response_handler(response)
+                break
+            except AmoCrmRepeatError:
+                if try_attempt >= 3:
                     raise
-                except Exception as e:
-                    raise AmoCrmError(f"[!] {response.status_code if response else '<No code!>'} |"
-                                      f" Неожиданная AMOCRM ошибка {e} ") from e
-        except AmoCrmNoConten:
-            break
+            except (AmoCrmNoConten, AmoCrmError):
+                raise
+            except requests.RequestException as e:
+                raise AmoCrmError(
+                    f"[!] {response.status_code if response else '<No code!>'} | "
+                    f"Unexpected AmoCRM request error: {e}"
+                ) from e
+        if not isinstance(json_data, dict):
+            raise AmoCrmError("AmoCRM response must be a JSON object")
+        embedded = json_data.get("_embedded")
+        if not isinstance(embedded, dict) or entity_name not in embedded:
+            raise AmoCrmError(
+                f"AmoCRM response is missing _embedded.{entity_name}"
+            )
+        entities = embedded[entity_name]
+        if not isinstance(entities, list):
+            raise AmoCrmError(
+                f"AmoCRM response _embedded.{entity_name} must be a list"
+            )
+
         if json_data is not None:
-            counter = 0
-            for entity in schema.load(json_data['_embedded'][entity_name]):
-                counter += 1
+            for payload in entities:
+                entity = _entity_from_api_payload(obj_cls, payload)
                 skip_entity = False
                 if custom_filter:
                     # if custom filter is not None then check custom field,
@@ -283,11 +374,15 @@ def amocrm_get(obj_cls: Type[BaseEntity],
             # condition to stop while loop
             if page:
                 break
-            if counter < limit:
+            next_url = (
+                json_data.get("_links", {})
+                .get("next", {})
+                .get("href")
+            )
+            if not next_url:
                 break
             time.sleep(1)
-            # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
+            url = next_url
             params = {}
 
 
@@ -301,7 +396,13 @@ def response_handler(response):
         json_data = {}
         try:
             json_data = response.json()
-        except Exception:
+        except ValueError:
             pass
         raise AmoCrmError(error_code=response.status_code, msg=json_data)
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as e:
+        raise AmoCrmError(
+            "AmoCRM returned invalid JSON",
+            error_code=response.status_code,
+        ) from e
